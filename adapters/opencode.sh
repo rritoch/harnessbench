@@ -2,8 +2,10 @@
 # opencode adapter. subcommands: invoke <workdir> <promptfile> <outdir> | metrics <workdir> <outdir>
 # NOTE: launch the exe directly (NOT the PowerShell .ps1 wrapper, which hangs at init on Windows).
 HB="$(cd "$(dirname "$0")/.." && pwd)"
-OC="${OPENCODE_EXE:-/c/Users/User/AppData/Local/hermes/node/node_modules/opencode-ai/bin/opencode.exe}"
-MODEL="${OPENCODE_MODEL:-llama.cpp/Qwen3.5-9B}"
+# default: the npm-installed "opencode" shim on PATH (a POSIX sh script that execs opencode.exe
+# directly) — NOT opencode.ps1, which is the PowerShell wrapper that hangs at init on Windows.
+OC="${OPENCODE_EXE:-opencode}"
+MODEL="${OPENCODE_MODEL:-openrouter/z-ai/glm-5.3-flash}"
 
 cmd="$1"; workdir="$2"
 if [ "$cmd" = "invoke" ]; then
