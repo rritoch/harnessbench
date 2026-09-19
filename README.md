@@ -88,6 +88,7 @@ export HB_ENDPOINT=http://localhost:8000/v1/chat/completions    # your server (p
 export HB_METRICS_URL=http://localhost:8000/metrics             # llama.cpp /metrics (primary token/tok-s source)
 export HB_MODEL=your-model-name                                 # model id your server expects
 export HB_RUNAWAY_TOKENS=8000                                   # kill+flag a task if it generates > this many tokens
+export HB_HEARTBEAT_S=30                                        # progress line every N s inside a run (0 = off)
 
 # tell the adapters where the harness CLIs live (examples):
 export PI_NODE=/usr/bin/node PI_CLI=~/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
@@ -129,6 +130,13 @@ Good to know:
   never parallelizes. Run order is shuffled to spread thermal drift fairly across harnesses.
 - **Resumable.** `out/results.csv` is the checkpoint. Ctrl-C anytime (or crash — we've tested
   that the hard way); re-running skips completed rows and continues.
+- **You can always tell it's alive.** Every progress line is timestamped and written to both the
+  console and `out/matrix.log` (append-only, so `tail -f out/matrix.log` works from another
+  window). Each run prints `[i/n]`, then `done in … | elapsed … | ETA …`; *inside* a run — which
+  can legitimately be silent for its whole 480 s timeout — a heartbeat every 30 s
+  (`HB_HEARTBEAT_S`) reports elapsed/budget and the harness log's byte count, so a growing log
+  means it's working. The full transcript of any single run is in
+  `runs/<harness>/<task>/rep<N>/run.log`.
 - **Token counts and tok/s come from the server when it exposes them.** `run_one.sh` snapshots
   llama.cpp's `/metrics` counters around each invoke; the delta gives prompt/output tokens and
   tok/s from the run's *actual* requests at real context depth (logged per-run to
@@ -250,7 +258,8 @@ run_one.sh           one (harness,task,repeat): setup -> invoke (timeout + runaw
 run_matrix.sh        the full matrix (sequential, resumable, shuffled, warmup)
 probe_tokps.sh       synthetic tok/s probe (fallback when the server has no /metrics)
 score.py             scoring -> out/scores.json + out/LEADERBOARD.md
-out/                 your results (gitignored): results.csv, server_usage.csv, tokps.csv, flags.csv
+out/                 your results (gitignored): results.csv, matrix.log, server_usage.csv,
+                     tokps.csv, flags.csv
 ```
 
 ## License

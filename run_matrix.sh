@@ -30,6 +30,7 @@ done
 if [ "$RESET" -eq 1 ]; then
   echo "RESET will permanently delete the benchmark checkpoint and per-run outputs:"
   echo "  $HB/out/results.csv"
+  echo "  $HB/out/matrix.log"
   echo "  $HB/out/server_usage.csv"
   echo "  $HB/out/flags.csv"
   echo "  $HB/runs/   (all per-run working dirs, logs, and grades)"
@@ -50,7 +51,7 @@ if [ "$RESET" -eq 1 ]; then
     if [ -z "$confirm" ]; then echo "reset aborted (no changes made)."; exit 0; fi
     echo "  got '$confirm' — type exactly 'yes', or press Enter to cancel."
   done
-  rm -f "$HB/out/results.csv" "$HB/out/server_usage.csv" "$HB/out/flags.csv"
+  rm -f "$HB/out/results.csv" "$HB/out/matrix.log" "$HB/out/server_usage.csv" "$HB/out/flags.csv"
   # runs/ can hold a working dir a lingering harness process (node/opencode/hermes) still has open,
   # which rm reports as "Device or resource busy". Capture that instead of falsely claiming success.
   rm_err=$(rm -rf "$HB/runs" 2>&1)
@@ -79,8 +80,21 @@ RES="$HB/out/results.csv"
 # here could false-match repeat/seed against later numeric columns and silently skip a run
 done_key(){ grep -q "^$1,$2,[^,]*,[^,]*,$3,$4," "$RES" 2>/dev/null; }
 
-echo "HarnessBench matrix: harnesses=[$HARNESSES] tasks=${#TASK_IDS[@]} repeats=$REPEATS"
-[ -f "$RES" ] && echo "resuming; $(($(wc -l < "$RES")-1)) rows already present"
+# Progress goes to the console AND to out/matrix.log, so a run you walked away from (or a
+# terminal that scrolled/froze) still leaves something to read. The log is append-only across
+# runs; run_one.sh's own per-run output stays on the console, and each harness's full transcript
+# is already in runs/<harness>/<task>/rep<N>/run.log.
+LOG="$HB/out/matrix.log"
+mkdir -p "$HB/out"
+log(){ printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
+
+# elapsed seconds -> compact h/m/s
+dur(){ local s=$1; if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s/3600)) $(((s%3600)/60));
+       elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s/60)) $((s%60)); else printf '%ds' "$s"; fi; }
+
+log "HarnessBench matrix: harnesses=[$HARNESSES] tasks=${#TASK_IDS[@]} repeats=$REPEATS"
+log "logging to out/matrix.log"
+[ -f "$RES" ] && log "resuming; $(($(wc -l < "$RES")-1)) rows already present"
 
 # build the run list (harness,task,repeat,seed)
 RUNLIST=()
@@ -94,29 +108,54 @@ done
 
 # deterministic-ish shuffle (interleave to spread thermal drift) without Math.random:
 # sort by a hash of the line so order is stable but mixed across harness/task.
-mapfile -t RUNLIST < <(for x in "${RUNLIST[@]}"; do
-  hsh=$(echo "$x" | "$PY" -c "import sys,hashlib;print(hashlib.md5(sys.stdin.read().encode()).hexdigest())")
-  echo "$hsh $x"
-done | sort | cut -d' ' -f2-)
+# ONE python process for the whole list, not one per entry. The per-entry version spawned a
+# process per run (200 tasks x N repeats): ~20s from a plain shell, but minutes-to-wedged from an
+# interactive Git Bash, where every native exe spawn allocates a Windows console — enough
+# conhost churn to leave mintty itself "not responding". It also printed nothing while it ran,
+# so the only symptom was a dead terminal. Same ordering as before: md5 of the line plus its
+# trailing newline, ascending.
+log "planning ${#RUNLIST[@]} runs..."
+# NB: writes through sys.stdout.buffer. Python opens stdout in text mode on Windows and would
+# translate every \n to \r\n, so each entry would reach bash with a trailing CR — and the last
+# field is the SEED, which would arrive as '1001\r' and land in results.csv that way.
+mapfile -t RUNLIST < <(printf '%s\n' "${RUNLIST[@]}" | "$PY" -c "
+import sys, hashlib
+lines = [l.rstrip('\r\n') for l in sys.stdin if l.strip()]
+lines.sort(key=lambda s: hashlib.md5((s + '\n').encode()).hexdigest())
+sys.stdout.buffer.write(''.join(l + '\n' for l in lines).encode())
+")
+[ "${#RUNLIST[@]}" -gt 0 ] || { echo "run list is empty (is '$PY' on PATH?)" >&2; exit 1; }
 
-# warmup (discarded) per harness
+# warmup (discarded) per harness. Its output is discarded, so announce both ends — a silent
+# 30-90s gap here is indistinguishable from a hang.
 if [ "$WARMUP" -eq 1 ]; then
   for h in "${HLIST[@]}"; do
-    echo "== warmup $h (discarded) =="
+    log "== warmup $h (discarded; output suppressed, may take a minute) =="
+    wstart=$(date +%s)
     bash "$HB/run_one.sh" "$h" greet_format 0 1 noprobe >/dev/null 2>&1 || true
     rm -rf "$HB/runs/$h/greet_format/rep0"
+    log "== warmup $h done in $(dur $(( $(date +%s) - wstart ))) =="
   done
 fi
 
-i=0; n=${#RUNLIST[@]}
+i=0; n=${#RUNLIST[@]}; t0=$(date +%s); ran=0
 for entry in "${RUNLIST[@]}"; do
   IFS='|' read -r h t r s <<< "$entry"
   i=$((i+1))
   if done_key "$h" "$t" "$r" "$s"; then
-    echo "[$i/$n] skip (done) $h/$t rep$r"; continue
+    log "[$i/$n] skip (done) $h/$t rep$r"; continue
   fi
-  echo "[$i/$n] $h/$t rep$r seed$s"
-  bash "$HB/run_one.sh" "$h" "$t" "$r" "$s" "$PROBE"
+  # no per-iteration subprocess here on purpose (the task's timeout budget is reported by
+  # run_one.sh's own heartbeat, which costs nothing extra)
+  log "[$i/$n] $h/$t rep$r seed$s"
+  rstart=$(date +%s)
+  # through tee so the run's own output (including its heartbeat) lands in the log as well —
+  # one tee per run, not per loop iteration. run_one.sh's exit code is not consulted here.
+  bash "$HB/run_one.sh" "$h" "$t" "$r" "$s" "$PROBE" 2>&1 | tee -a "$LOG"
+  now=$(date +%s); ran=$((ran+1)); elapsed=$((now - t0))
+  # ETA from this session's own average, over the runs still left (skips cost nothing)
+  eta=$(( (elapsed / ran) * (n - i) ))
+  log "[$i/$n] done in $(dur $((now - rstart))) | elapsed $(dur $elapsed) | ETA $(dur $eta)"
 done
 
-echo "matrix complete. score with:  python score.py"
+log "matrix complete in $(dur $(( $(date +%s) - t0 ))). score with:  python score.py"

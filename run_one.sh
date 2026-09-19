@@ -62,11 +62,24 @@ kill_tree(){
   kill -9 "$p" 2>/dev/null
 }
 
+# A task can legitimately run for its whole timeout (480s+) with the harness printing nothing,
+# which is indistinguishable from a wedge. The watchdog already wakes every 3s, so it also emits a
+# heartbeat: elapsed/budget plus the harness log's byte count, which is the cheap proof that the
+# harness is still producing output rather than stuck. HB_HEARTBEAT_S=0 turns it off.
+HEARTBEAT_S="${HB_HEARTBEAT_S:-30}"
+last_beat=$start
+
 # single watchdog enforcing BOTH the wall-clock timeout and the token runaway cap
 bash "$adapter" invoke "$work" "$rundir/prompt.txt" "$rundir" &
 pid=$!; deadline=$(( start + timeout_s ))
 while kill -0 "$pid" 2>/dev/null; do
   now=$(date +%s)
+  if [ "$HEARTBEAT_S" -gt 0 ] && [ $((now - last_beat)) -ge "$HEARTBEAT_S" ]; then
+    hblog="$rundir/run.json"; [ -f "$hblog" ] || hblog="$rundir/run.log"
+    hbsize=$(wc -c < "$hblog" 2>/dev/null | tr -d ' '); : "${hbsize:=0}"
+    echo "  ... $task rep$repeat: $((now - start))s/${timeout_s}s, harness log ${hbsize}B"
+    last_beat=$now
+  fi
   if [ "$now" -ge "$deadline" ]; then kill_tree "$pid"; timed_out=1; break; fi
   # live check: in-flight request's own decode count (catches a single runaway completion
   # immediately, without waiting for the request to finish). /slots keeps the LAST completed
