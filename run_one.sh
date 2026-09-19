@@ -129,9 +129,24 @@ fi
 
 # 6. metrics
 metrics=$(bash "$adapter" metrics "$work" "$rundir" 2>/dev/null)
-get(){ echo "$metrics" | grep -oE "$1=[0-9]+" | head -1 | cut -d= -f2; }
-toolcalls=$(get toolcalls); turns=$(get turns); out_tokens=$(get out_tokens); sv=$(get self_verify)
-: "${toolcalls:=0}" "${turns:=0}" "${out_tokens:=0}" "${sv:=0}"
+get(){ echo "$metrics" | grep -oE "(^| )$1=[0-9]+(\.[0-9]+)?" | head -1 | cut -d= -f2; }
+toolcalls=$(get toolcalls); turns=$(get turns); sv=$(get self_verify)
+: "${toolcalls:=0}" "${turns:=0}" "${sv:=0}"
+# token accounting, per run. An adapter reports what its harness's own log/session store knows:
+#   prompt_tokens       — non-cached input tokens billed for this task
+#   completion_tokens   — generated tokens (out_tokens is the original spelling, still accepted)
+#   cache_read_tokens   — input served from the provider's prompt cache, counted SEPARATELY from
+#                         prompt_tokens (adapters/usage.py normalizes providers that report the
+#                         cached count as a subset of prompt_tokens instead — OpenAI/OpenRouter)
+#   cache_write_tokens  — input written INTO the cache
+#   reasoning_tokens    — thinking tokens, when the harness separates them out
+#   cost_usd            — the harness's own price calculation, when it has one
+# Missing fields stay 0: a harness that doesn't instrument tokens reports 0 rather than a guess,
+# and score.py drops it from the cost report instead of summing zeros into a total.
+out_tokens=$(get completion_tokens); [ -z "$out_tokens" ] && out_tokens=$(get out_tokens)
+prompt_tokens=$(get prompt_tokens); cache_read=$(get cache_read_tokens)
+cache_write=$(get cache_write_tokens); reasoning=$(get reasoning_tokens); cost=$(get cost_usd)
+: "${out_tokens:=0}" "${prompt_tokens:=0}" "${cache_read:=0}" "${cache_write:=0}" "${reasoning:=0}" "${cost:=0}"
 
 # 6b. integrity scan: flag any sign the agent reached for the task dir (grade.py/hidden/ref)
 # or a grade dir. The gradedir is empty during the run, so this can't leak answers — but a
@@ -147,13 +162,19 @@ if [ -n "$flags" ]; then
 fi
 
 # 7. tok/s + token counts, measured from the run's own requests via /metrics deltas.
-# When the server exposes metrics, out_tokens and tokps are server-side truth (includes every
-# request the harness made, at real context depth); the synthetic probe is only a fallback.
-tokps=0; tok_src=probe
+# When the server exposes metrics, prompt/out tokens and tokps are server-side truth (every
+# request the harness made, at real context depth) and override the harness's self-report; the
+# synthetic probe is only a fallback. Cache tokens stay harness-reported either way — llama.cpp's
+# /metrics has no cache-hit counter, and its prompt_tokens_total counts tokens actually processed,
+# so a locally-served run legitimately reports 0 cached tokens.
+# tok_src records where the TOKEN COUNTS came from (server counters vs the harness's own log) —
+# the two are not commensurable across harnesses, so the cost report keeps them apart. The
+# synthetic probe only ever supplies tok/s, never a token count, so it is not a tok_src value.
+tokps=0; tok_src=harness
 read -r srv_prompt srv_gen srv_prompt_s srv_gen_s srv_tokps < <("$PY" "$HB/engine/metrics_delta.py" "$rundir/m0.prom" "$rundir/m1.prom" 2>/dev/null)
 : "${srv_prompt:=0}" "${srv_gen:=0}" "${srv_prompt_s:=0}" "${srv_gen_s:=0}" "${srv_tokps:=0}"
 if awk "BEGIN{exit !($srv_tokps > 0)}"; then
-  tokps=$srv_tokps; out_tokens=$srv_gen; tok_src=server
+  tokps=$srv_tokps; out_tokens=$srv_gen; prompt_tokens=$srv_prompt; tok_src=server
   USAGE="$HB/out/server_usage.csv"
   [ -f "$USAGE" ] || echo "harness,task,repeat,prompt_tokens,gen_tokens,prompt_s,gen_s,gen_tokps" > "$USAGE"
   echo "$harness,$task,$repeat,$srv_prompt,$srv_gen,$srv_prompt_s,$srv_gen_s,$srv_tokps" >> "$USAGE"
@@ -162,10 +183,18 @@ elif [ "$noprobe" != "noprobe" ]; then
   tokps=$(echo "$pline" | cut -d, -f3); : "${tokps:=0}"
 fi
 
-# 8. record
-RES="$HB/out/results.csv"
+# 8. record. Written by column name (engine/append_result.py owns the schema and migrates an
+# older results.csv in place), so adding a measurement can't shift an existing column.
 mkdir -p "$HB/out"
-[ -f "$RES" ] || echo "harness,task,domain,difficulty,repeat,seed,status,pass,wall_s,toolcalls,turns,out_tokens,self_verify,tokps" > "$RES"
-echo "$harness,$task,$domain,$difficulty,$repeat,$seed,$status,$passed,$wall,$toolcalls,$turns,$out_tokens,$sv,$tokps" >> "$RES"
-echo "[$harness/$task rep$repeat] $status pass=$passed wall=${wall}s tools=$toolcalls turns=$turns out_tok=$out_tokens sv=$sv tokps=$tokps (src=$tok_src)"
+"$PY" "$HB/engine/append_result.py" "$HB/out/results.csv" \
+  "harness=$harness" "task=$task" "domain=$domain" "difficulty=$difficulty" \
+  "repeat=$repeat" "seed=$seed" "status=$status" "pass=$passed" "wall_s=$wall" \
+  "toolcalls=$toolcalls" "turns=$turns" "self_verify=$sv" \
+  "prompt_tokens=$prompt_tokens" "out_tokens=$out_tokens" \
+  "cache_read_tokens=$cache_read" "cache_write_tokens=$cache_write" \
+  "reasoning_tokens=$reasoning" "cost_usd=$cost" "tok_src=$tok_src" "tokps=$tokps"
+# awk, not $(( )): a harness may report a fractional token count and shell arithmetic would abort
+total_tokens=$(awk "BEGIN{printf \"%d\", $prompt_tokens + $out_tokens + $cache_read + $cache_write}")
+echo "[$harness/$task rep$repeat] $status pass=$passed wall=${wall}s tools=$toolcalls turns=$turns sv=$sv tokps=$tokps"
+echo "  tokens(src=$tok_src): prompt=$prompt_tokens completion=$out_tokens cache_r=$cache_read cache_w=$cache_write total=$total_tokens"
 echo "  grade: $gout" | head -1

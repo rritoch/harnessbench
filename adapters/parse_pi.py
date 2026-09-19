@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Parse a pi `--mode json` JSONL run -> uniform metrics line.
+"""Parse a pi `--mode json` JSONL run -> uniform metrics line (see adapters/usage.py).
 usage: parse_pi.py <run.json>
-prints: toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=a,b,c
 """
-import sys, json
+import sys, json, usage as U
+
 
 EXEC = {"bash", "shell", "run", "exec", "python", "pytest", "test", "execute"}
 WRITE = {"write", "edit", "create", "str_replace", "apply_patch", "patch", "multiedit"}
 
+
 def main():
     path = sys.argv[1]
-    turns = toolcalls = out_tokens = 0
+    turns = toolcalls = 0
+    totals = U.new_totals()
+    cost = 0.0
     tools = []
     try:
         lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
     except Exception:
-        print("toolcalls=0 turns=0 out_tokens=0 self_verify=0 tools=-"); return
+        lines = []
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -34,7 +37,13 @@ def main():
         elif t == "message_end":
             m = o.get("message", {})
             if m.get("role") == "assistant":
-                out_tokens += (m.get("usage") or {}).get("output", 0) or 0
+                cost += U.add_usage(totals, m.get("usage") or {})
+
+    # Fallback for a backend whose usage pi doesn't surface on message_end: scan the raw log for
+    # response-level usage objects (OpenRouter and any OpenAI-compatible endpoint return them).
+    # Only when the structured path found nothing, so the two can't double-count.
+    if not any(totals.values()):
+        totals, cost, _ = U.scan_log(path, totals)
 
     # self_verify: an exec-ish tool after the last write-ish tool
     last_write = max([i for i, t in enumerate(tools) if t in WRITE], default=-1)
@@ -42,8 +51,8 @@ def main():
     # also count "ran something at all" if no writes but executed (e.g., data tasks)
     if last_write < 0 and any(t in EXEC for t in tools):
         sv = 1
-    print("toolcalls=%d turns=%d out_tokens=%d self_verify=%d tools=%s"
-          % (toolcalls, turns, out_tokens, sv, ",".join(tools) if tools else "-"))
+    print(U.metrics_line(toolcalls, turns, sv, tools, totals, cost))
+
 
 if __name__ == "__main__":
     main()

@@ -38,6 +38,46 @@ Anchors are fixed, so adding a new harness never changes existing harnesses' sco
   tokens, a wall-clock fallback (`wall_s ÷ difficulty` vs fixed anchors) is used instead. R≈1 means
   "all time is generation" (ideal); high R means prompt/per-turn overhead.
 
+## Token accounting and harness cost (report-only)
+Every run records what it consumed, and the leaderboard sums those counts per harness. Two
+harnesses driving the same model on the same tasks differ by an order of magnitude in tokens —
+that difference *is* the harness (context packing, re-reads, retries, sub-agents), and it is what
+you pay for.
+
+Four counts per run, in `out/results.csv` (one row per harness × task × repeat):
+
+| Column | Meaning |
+|--------|---------|
+| `prompt_tokens` | input tokens billed at full price, **excluding** cache hits |
+| `out_tokens` | completion (generated) tokens |
+| `cache_read_tokens` | input served from the provider's prompt cache |
+| `cache_write_tokens` | input written into the cache |
+| `reasoning_tokens` | thinking tokens, where the harness separates them (a breakdown **of** completion — reported, never added to a total) |
+| `cost_usd` | the harness's/provider's own price for the run, when it reports one |
+| `tok_src` | `server` (llama.cpp counter deltas) or `harness` (the harness's own ledger) |
+
+**"Prompt excludes cache" is a normalization, not a given.** Anthropic and opencode's session
+store report the two as disjoint; OpenAI/OpenRouter's `prompt_tokens` is the *total* input with
+`prompt_tokens_details.cached_tokens` naming the cached part of it. `adapters/usage.py` subtracts
+in the second case, so a total means the same thing for every harness — summing the raw fields
+across both shapes double-counts every cached token, and on an agent harness cached input is
+usually the largest single count.
+
+**Where the counts come from.** In order: llama.cpp `/metrics` deltas around the invoke
+(`tok_src=server`, prompt + completion only — `/metrics` has no cache-hit counter, so a locally
+served run legitimately reports 0 cached tokens); else the harness's own ledger (a session DB, a
+structured event stream); else a scan of the run log for the provider's response `usage` objects,
+which OpenRouter and every OpenAI-compatible endpoint return per request. A harness that
+instruments none of these reports **0 and is excluded from the cost table** — not summed as zero,
+which would publish a false comparison.
+
+**The reported metric.** `total = prompt + completion + cache read + cache write`, summed over
+every scored run (the discarded warmup is excluded), plus `tok/run` and **`tok/pass`** — total
+tokens ÷ runs that passed, i.e. what one *solved* task costs. Read `tok/pass` next to Correctness:
+on total alone, a harness that gives up early wins. None of this enters the composite: cost is a
+property of the harness × model × task set, and folding it into a correctness-anchored score would
+make a cheap failure look like a good one.
+
 ## Failure taxonomy (not just pass/fail)
 Each run is classified PASS / WRONG / CRASH / TIMEOUT / REFUSED. CRASH/TIMEOUT/REFUSED reduce the
 clean-completion component of Reliability more than a clean WRONG answer. Every task has a hard
@@ -151,8 +191,14 @@ multi-step pipelines).
   validated across harnesses) and the synthetic tok/s probe uses a fixed generation whose
   speculative-decoding acceptance differs from real task content, so fallback-mode Efficiency
   carries normalization noise. Don't mix server-measured and probe-measured rows in one
-  leaderboard (`src=` is recorded per run). Wall-clock-fallback Efficiency scores are asterisked
+  leaderboard (`tok_src` is recorded per run). Wall-clock-fallback Efficiency scores are asterisked
   in the leaderboard and are not commensurable with overhead-ratio scores.
+- **The cost table is self-reported wherever `tok_src=harness`.** Cache counts in particular have
+  no server-side source, so they are whatever the harness's ledger or its provider's response says
+  — a harness could under-report, and nothing here would catch it. The counts are normalized to a
+  common convention (see *Token accounting*), not independently verified; treat a cost comparison
+  as a comparison of harnesses' own books. `cost_usd` is likewise the harness's arithmetic at its
+  own prices, so it is only comparable between harnesses on the same model and provider.
 - **Difficulty weights are author-assigned** ordinals used as ratio weights; re-run `score.py`
   with different `WEIGHTS`/difficulties to check sensitivity (results ship with the per-task table
   so readers can re-derive).
@@ -161,6 +207,17 @@ multi-step pipelines).
 Write `adapters/<name>.sh` with two subcommands:
 - `invoke <workdir> <promptfile> <outdir>` — run the harness non-interactively in `workdir`, write its
   log to `outdir` (return its exit code).
-- `metrics <workdir> <outdir>` — print `toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=...`
-  parsed from the harness's logs/session store.
+- `metrics <workdir> <outdir>` — print one line of `key=value` metrics parsed from the harness's
+  logs/session store:
+  ```
+  toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=a,b,c
+  prompt_tokens=N completion_tokens=N cache_read_tokens=N cache_write_tokens=N
+  reasoning_tokens=N cost_usd=X
+  ```
+  (one physical line). Only the first five are required; a token count you can't source is
+  reported as **0**, which the cost table reads as "not instrumented" rather than as free.
+  `adapters/usage.py` does the work — `add_usage()` normalizes any provider's usage object
+  (Anthropic / OpenAI / OpenRouter / AI-SDK spellings, including the cached-token convention),
+  `scan_log()` pulls response-level `usage` out of a raw log when the harness keeps no ledger of
+  its own, and `metrics_line()` formats the contract line.
 Then `bash run_matrix.sh --harness <name>`. No other code changes are needed.

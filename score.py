@@ -59,14 +59,23 @@ def interp(x, anchors):
 EFF_ANCHORS = [(1.0, 100), (1.5, 92), (2.0, 84), (3.0, 68), (5.0, 45), (8.0, 22), (12.0, 8), (20.0, 3)]
 EFF_FALLBACK = [(20, 100), (45, 85), (80, 68), (140, 45), (240, 22), (400, 8)]   # wall_s / difficulty
 
+# The billed per-run token counts (engine/append_result.py owns the column names); out_tokens is
+# the completion count under its original name. Their sum is a run's total cost, and a harness's
+# cost is the sum over its runs — summed, never averaged.
+# reasoning_tokens is deliberately NOT here: for every provider in use it is a breakdown OF
+# completion_tokens, so adding it would charge those tokens twice. It is carried alongside.
+TOKEN_FIELDS = ["prompt_tokens", "out_tokens", "cache_read_tokens", "cache_write_tokens"]
+
 def load(path):
     rows = []
     with open(path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            for k in ("difficulty", "repeat", "pass", "wall_s", "toolcalls", "turns",
-                      "out_tokens", "self_verify"):
+            for k in (["difficulty", "repeat", "pass", "wall_s", "toolcalls", "turns",
+                       "self_verify", "reasoning_tokens", "cost_usd"] + TOKEN_FIELDS):
                 r[k] = float(r[k]) if r.get(k) not in (None, "") else 0.0
             r["tokps"] = float(r["tokps"]) if r.get("tokps") not in (None, "") else 0.0
+            r["tok_src"] = r.get("tok_src") or ""
+            r["total_tokens"] = sum(r[k] for k in TOKEN_FIELDS)
             if r["repeat"] == 0:
                 continue   # repeat 0 = discarded warmup run; never scored
             rows.append(r)
@@ -93,7 +102,9 @@ def task_aggregate(reps):
         diff = reps[0]["difficulty"] or 1
         eff = interp(med_wall / diff, EFF_FALLBACK)
         eff_mode = "wallclock"
-    return {
+    # token cost of this task: the median is what one run of it costs (comparable across
+    # harnesses that ran different numbers of repeats), the sum is what it actually consumed.
+    agg = {
         "difficulty": reps[0]["difficulty"], "domain": reps[0]["domain"],
         "pass_rate": sum(passes) / len(passes),
         "pass_all": 1.0 if all(p >= 1 for p in passes) else 0.0,
@@ -102,7 +113,41 @@ def task_aggregate(reps):
         "self_verify_rate": sum(sv) / len(sv),
         "has_tools": has_tools,
         "med_wall": med_wall, "eff": eff, "eff_mode": eff_mode, "n": len(reps),
+        "med_total_tokens": statistics.median([r["total_tokens"] for r in reps]),
+        "sum_total_tokens": sum(r["total_tokens"] for r in reps),
+        "sum_cost_usd": sum(r["cost_usd"] for r in reps),
+        "tok_src": sorted({r["tok_src"] for r in reps if r["tok_src"]}),
     }
+    for k in TOKEN_FIELDS + ["reasoning_tokens"]:
+        agg["med_" + k] = statistics.median([r[k] for r in reps])
+        agg["sum_" + k] = sum(r[k] for r in reps)
+    return agg
+
+def cost_report(tasks):
+    """Token cost of running the whole suite with this harness: the per-task sums, summed.
+
+    Report-only — it is deliberately NOT in the composite. Tokens are the harness's consumption of
+    a shared model, and a harness that gives up early would 'win' on cost; read it against
+    Correctness (tokens_per_pass does exactly that: total tokens divided by the number of runs
+    that actually passed, i.e. what one solved task costs).
+
+    Unlike every other figure here, these are NOT cluster-weighted: this is what the runs cost,
+    not an estimate of a skill."""
+    runs = sum(a["n"] for a in tasks.values())
+    passes = sum(a["pass_rate"] * a["n"] for a in tasks.values())
+    rep = {"runs": runs, "passes": round(passes, 1)}
+    for k in TOKEN_FIELDS + ["reasoning_tokens"]:
+        rep[k] = int(sum(a["sum_" + k] for a in tasks.values()))
+    rep["total_tokens"] = int(sum(a["sum_total_tokens"] for a in tasks.values()))
+    rep["cost_usd"] = round(sum(a["sum_cost_usd"] for a in tasks.values()), 4)
+    # a harness with no token instrumentation reports zeros; say so rather than publishing a 0 total
+    rep["instrumented"] = rep["total_tokens"] > 0
+    rep["tokens_per_run"] = int(rep["total_tokens"] / runs) if runs else 0
+    rep["tokens_per_pass"] = int(rep["total_tokens"] / passes) if passes else None
+    rep["cost_per_pass_usd"] = round(rep["cost_usd"] / passes, 4) if passes and rep["cost_usd"] else None
+    srcs = sorted({s for a in tasks.values() for s in a["tok_src"]})
+    rep["tok_src"] = ",".join(srcs)
+    return rep
 
 def kendall_tau_b(x, y):
     """Tie-corrected Kendall rank correlation (tau-b). O(n^2), fine for n<=few hundred."""
@@ -260,6 +305,7 @@ def main():
             "tau_effort": round(tau_eff, 3) if tau_eff is not None else None,
             "pass_at_k": round(100 * sum(w[t] * tasks[t]["pass_any"] for t in tasks) / tw, 1),
             "pass_pow_k": round(100 * sum(w[t] * tasks[t]["pass_all"] for t in tasks) / tw, 1),
+            "cost": cost_report(tasks),
             "tasks": {t: {kk: (round(vv, 2) if isinstance(vv, float) else vv)
                           for kk, vv in a.items()} for t, a in tasks.items()},
         }
@@ -276,6 +322,51 @@ def main():
     json.dump(out, open(os.path.join(HB, "out", "scores.json"), "w", encoding="utf-8"), indent=2)
     render(out)
     print("wrote out/scores.json and out/LEADERBOARD.md")
+
+def human(n):
+    """Compact token counts: the totals run to hundreds of millions and a raw digit string in a
+    markdown cell is unreadable."""
+    for unit, div in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if abs(n) >= div:
+            return "%.2f%s" % (n / div, unit)
+    return "%d" % n
+
+def render_cost(out):
+    """The harness cost table: every scored run's tokens, summed per harness."""
+    H = out["harnesses"]
+    have = [h for h in H if H[h].get("cost", {}).get("instrumented")]
+    missing = [h for h in H if h not in have]
+    lines = ["\n## Harness cost (report-only, not in OVERALL)\n"]
+    if not have:
+        lines.append("No harness reported token counts (every adapter's `metrics` returned 0) — "
+                     "see SPEC.md, *Token accounting*.\n")
+        return lines
+    lines.append("Summed over every scored run (the discarded warmup is excluded). "
+                 "`prompt` excludes cached input, which is counted under `cache rd`; `total` is "
+                 "prompt + completion + cache read + cache write. **tok/pass** = total tokens ÷ "
+                 "runs that passed — the tokens one solved task costs, which is the number to read "
+                 "next to Correctness (a harness that gives up early looks cheap on total alone).\n")
+    lines.append("| Harness | runs | prompt | cache rd | cache wr | completion | **total** | "
+                 "tok/run | tok/pass | $ | src |")
+    lines.append("|---------|-----:|-------:|---------:|---------:|-----------:|----------:|"
+                 "--------:|---------:|--:|:---:|")
+    for h in sorted(have, key=lambda h: H[h]["cost"]["total_tokens"]):
+        c = H[h]["cost"]
+        lines.append("| %s | %d | %s | %s | %s | %s | **%s** | %s | %s | %s | %s |" % (
+            h, c["runs"], human(c["prompt_tokens"]), human(c["cache_read_tokens"]),
+            human(c["cache_write_tokens"]), human(c["out_tokens"]), human(c["total_tokens"]),
+            human(c["tokens_per_run"]),
+            human(c["tokens_per_pass"]) if c["tokens_per_pass"] else "—",
+            "%.2f" % c["cost_usd"] if c["cost_usd"] else "—", c["tok_src"] or "—"))
+    if missing:
+        lines.append("\nNo token instrumentation (excluded above, not scored as zero): %s."
+                     % ", ".join(sorted(missing)))
+    if any(H[h]["cost"]["tok_src"] == "harness" for h in have) and \
+       any(H[h]["cost"]["tok_src"] == "server" for h in have):
+        lines.append("\n**Mixed sources.** Some totals are server-measured (`server`) and some are "
+                     "self-reported by the harness (`harness`); those two are not commensurable — "
+                     "compare within a source, not across.")
+    return lines
 
 def render(out):
     H = out["harnesses"]
@@ -308,13 +399,18 @@ def render(out):
                  "tasks fail every run (systematic), low = failures wander between runs (sampling "
                  "noise) — read it together with the pass@k vs pass^k gap. τ-eff compares wall-time "
                  "rankings: high = task cost is a stable property of the task.")
+    lines.extend(render_cost(out))
     if out.get("paired"):
         lines.append("\n## Paired comparisons (per-cluster pass rate, sign-flip permutation test)\n")
         lines.append("| Pair | mean Δpass | p (two-sided) |")
         lines.append("|------|-----------:|--------------:|")
         for pair, d in sorted(out["paired"].items()):
             lines.append("| %s | %+.3f | %.4f |" % (pair, d["pass_rate_diff"], d["p"]))
-    lines.append("\n## Per-task pass rate (by difficulty)\n")
+    lines.append("\n## Per-task pass rate and token cost (by difficulty)\n")
+    lines.append("Each cell is `pass rate · median total tokens per run` (prompt + completion + "
+                 "cache read + cache write; `—` where the harness reports no token counts). "
+                 "Per-run and per-repeat counts are in `out/results.csv`, the full per-task "
+                 "breakdown in `out/scores.json`.\n")
     all_tasks = sorted({t for h in H for t in H[h]["tasks"]},
                        key=lambda t: (-next(H[h]["tasks"][t]["difficulty"] for h in H if t in H[h]["tasks"]), t))
     head = "| Task | d | " + " | ".join(order) + " |"
@@ -325,7 +421,12 @@ def render(out):
         cells = []
         for h in order:
             a = H[h]["tasks"].get(t)
-            cells.append("%.0f%%" % (100 * a["pass_rate"]) if a else "—")
+            if not a:
+                cells.append("—")
+                continue
+            tok = a.get("med_total_tokens") or 0
+            cells.append("%.0f%%%s" % (100 * a["pass_rate"],
+                                       " · %s" % human(tok) if tok else ""))
         lines.append("| %s | %d | %s |" % (t, int(d), " | ".join(cells)))
     open(os.path.join(HB, "out", "LEADERBOARD.md"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
 

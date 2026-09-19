@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Best-effort parse of hermes state.db -> uniform metrics line.
+"""Best-effort parse of hermes state.db -> uniform metrics line (see adapters/usage.py).
 usage: parse_hermes.py <workdir> [run.log]
-prints: toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=a,b,c
 hermes strips tool calls from -z/--cli stdout, so metrics come from state.db when available.
 """
-import sys, os, sqlite3, json, re
+import sys, os, sqlite3, json, usage as U
 
 EXEC = {"bash", "shell", "terminal", "run", "exec", "python", "code_execution", "execute"}
 WRITE = {"write", "edit", "create", "str_replace", "apply_patch", "file", "write_file", "edit_file"}
+
 
 def db_path():
     for p in [os.path.join(os.environ.get("LOCALAPPDATA", ""), "hermes", "state.db"),
@@ -16,31 +16,42 @@ def db_path():
             return p
     return None
 
-def extract_tools(data):
-    """Pull tool names (in order) from a hermes message JSON blob."""
-    names = []
+
+def walk_message(data, names, usages):
+    """Collect tool names (in order) and usage objects from a hermes message JSON blob.
+
+    hermes has no token ledger of its own, so the usage objects its stored messages carry — the
+    provider's own response usage, which OpenRouter and every OpenAI-compatible endpoint return —
+    are the token counts. One walk collects both: they live in the same blob."""
     try:
         obj = json.loads(data) if isinstance(data, str) else data
     except Exception:
-        return names
+        return
+
     def walk(x):
         if isinstance(x, dict):
             if x.get("type") in ("tool_use", "tool_call", "function_call") or "tool_name" in x:
                 nm = x.get("name") or x.get("tool_name") or (x.get("function") or {}).get("name")
                 if nm:
                     names.append(str(nm).lower())
-            for v in x.values():
+            for k, v in x.items():
+                if k == "usage" and isinstance(v, dict):
+                    usages.append(v)
                 walk(v)
         elif isinstance(x, list):
             for v in x:
                 walk(v)
     walk(obj)
-    return names
+
 
 def main():
     workdir = sys.argv[1]
+    runlog = sys.argv[2] if len(sys.argv) > 2 else None
     tools = []
-    turns = out_tokens = 0
+    usages = []
+    turns = 0
+    totals = U.new_totals()
+    cost = 0.0
     dbp = db_path()
     if dbp:
         try:
@@ -56,9 +67,10 @@ def main():
             cur.execute("SELECT * FROM sessions ORDER BY %s DESC LIMIT 50" % order)
             rows = cur.fetchall()
             wdbase = os.path.basename(os.path.abspath(workdir)).lower()
+            wdfull = os.path.abspath(workdir).replace(os.sep, "/").lower()
             for r in rows:
                 vals = " ".join(str(r[c]).lower() for c in scols if r[c] is not None)
-                if wdbase in vals or os.path.abspath(workdir).replace("\\", "/").lower() in vals:
+                if wdbase in vals or wdfull in vals:
                     sid = r["id"] if "id" in scols else r[0]; break
             if sid is None and rows:
                 sid = rows[0]["id"] if "id" in scols else rows[0][0]
@@ -70,19 +82,27 @@ def main():
             if datacol and sidcol and sid is not None:
                 cur.execute("SELECT %s AS d FROM messages WHERE %s=? ORDER BY rowid" % (datacol, sidcol), (sid,))
                 for m in cur.fetchall():
-                    nm = extract_tools(m["d"])
-                    if nm:
-                        tools.extend(nm); turns += 1
-                    # rough token estimate from text length if usage absent
+                    before = len(tools)
+                    walk_message(m["d"], tools, usages)
+                    if len(tools) > before:
+                        turns += 1
         except Exception:
             pass
+
+    for u in usages:
+        cost += U.add_usage(totals, u)
+
+    # Fallback: the stdout log, when the stored messages carried no usage (hermes' --cli output
+    # sometimes holds the raw response, and the DB may not be readable at all).
+    if not any(totals.values()) and runlog:
+        totals, cost, _ = U.scan_log(runlog, totals)
 
     toolcalls = len(tools)
     last_write = max([i for i, t in enumerate(tools) if t in WRITE], default=-1)
     sv = 1 if (last_write >= 0 and any(t in EXEC for t in tools[last_write + 1:])) else (
         1 if (last_write < 0 and any(t in EXEC for t in tools)) else 0)
-    print("toolcalls=%d turns=%d out_tokens=%d self_verify=%d tools=%s"
-          % (toolcalls, turns, out_tokens, sv, ",".join(tools) if tools else "-"))
+    print(U.metrics_line(toolcalls, turns, sv, tools, totals, cost))
+
 
 if __name__ == "__main__":
     main()

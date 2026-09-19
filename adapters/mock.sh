@@ -13,5 +13,8 @@ if [ "$cmd" = "invoke" ]; then
   echo "mock: wrote reference solution and verified" > "$outdir/run.log"
   exit 0
 elif [ "$cmd" = "metrics" ]; then
-  echo "toolcalls=4 turns=4 out_tokens=300 self_verify=1 tools=read,write,bash,bash"
+  # fixed but plausible, including the token accounting (see adapters/usage.py for the contract)
+  echo "toolcalls=4 turns=4 out_tokens=300 self_verify=1 tools=read,write,bash,bash" \
+       "prompt_tokens=2500 completion_tokens=300 cache_read_tokens=9000 cache_write_tokens=1200" \
+       "reasoning_tokens=80 cost_usd=0.004200"
 fi

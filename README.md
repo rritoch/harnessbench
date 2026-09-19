@@ -129,13 +129,21 @@ Good to know:
   never parallelizes. Run order is shuffled to spread thermal drift fairly across harnesses.
 - **Resumable.** `out/results.csv` is the checkpoint. Ctrl-C anytime (or crash — we've tested
   that the hard way); re-running skips completed rows and continues.
-- **Token counts and tok/s come from the server, not the harness.** `run_one.sh` snapshots
-  llama.cpp's `/metrics` counters around each invoke; the delta gives output tokens and tok/s from
-  the run's *actual* requests at real context depth (logged per-run to `out/server_usage.csv`,
-  results line shows `src=server`). Launch your server with `--metrics` to enable this. Without it,
-  a synthetic tok/s probe fires between runs into `out/tokps.csv` as a fallback (`src=probe`) —
-  either way Efficiency is normalized by your server's actual speed, so a faster GPU doesn't make
-  a harness look smarter.
+- **Token counts and tok/s come from the server when it exposes them.** `run_one.sh` snapshots
+  llama.cpp's `/metrics` counters around each invoke; the delta gives prompt/output tokens and
+  tok/s from the run's *actual* requests at real context depth (logged per-run to
+  `out/server_usage.csv`, results row shows `tok_src=server`). Launch your server with `--metrics`
+  to enable this. Without it, tokens come from the harness's own ledger (`tok_src=harness`) and a
+  synthetic tok/s probe fires between runs into `out/tokps.csv` — either way Efficiency is
+  normalized by your server's actual speed, so a faster GPU doesn't make a harness look smarter.
+- **Every run records what it cost.** Prompt, completion, cache-read and cache-write tokens (plus
+  reasoning tokens and `cost_usd` where the harness reports them) go into `out/results.csv` per
+  harness × task × repeat, and `score.py` sums them into a **Harness cost** table — including
+  `tok/pass`, the tokens one *solved* task costs. Hosted endpoints are covered without a local
+  server: OpenRouter and every OpenAI-compatible API return `usage` (with
+  `prompt_tokens_details.cached_tokens` and `cost`) in each response, and the adapters read it.
+  It's report-only — cost never enters the composite. See [SPEC.md](SPEC.md) → *Token accounting
+  and harness cost*.
 - **Runaway protection.** Alongside each task's wall-clock timeout, `run_one.sh` watches the
   server's generated-token counter live; a task that spirals past `HB_RUNAWAY_TOKENS` (default
   8000) is killed and logged `RUNAWAY` (`pass=0`, counted as a non-clean completion). Set it
@@ -156,7 +164,7 @@ Then score and read:
 
 ```bash
 python score.py
-cat out/LEADERBOARD.md      # leaderboard + per-task table + paired significance tests
+cat out/LEADERBOARD.md      # leaderboard + harness cost + per-task table + significance tests
 ```
 
 `out/scores.json` has the full per-task breakdown. To re-weight the composite, edit `WEIGHTS`
@@ -183,9 +191,18 @@ One file. Drop `adapters/<name>.sh` with two subcommands:
 # run the harness non-interactively in <workdir> on the prompt; log to <outdir>
 invoke <workdir> <promptfile> <outdir>
 
-# parse your harness's own logs into uniform metrics
-metrics <workdir> <outdir>     # prints: toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=a,b
+# parse your harness's own logs into uniform metrics (one line)
+metrics <workdir> <outdir>     # toolcalls=N turns=N out_tokens=N self_verify=0|1 tools=a,b
+                               # prompt_tokens=N completion_tokens=N cache_read_tokens=N
+                               # cache_write_tokens=N reasoning_tokens=N cost_usd=X
 ```
+
+Import `adapters/usage.py` for the token half: `add_usage()` takes a `usage` object in any
+provider's spelling (Anthropic, OpenAI/OpenRouter, AI-SDK) and normalizes it, `scan_log()` pulls
+response-level usage straight out of a raw log if your harness keeps no ledger, and
+`metrics_line()` formats the contract line. Report **0** for a count you can't source — the cost
+table treats 0 as "not instrumented" and leaves your harness out of it, rather than publishing it
+as free.
 
 Look at `adapters/pi.sh` (JSON log parsing) or `adapters/mock.sh` (smallest possible example).
 Then `bash run_matrix.sh --harness yourname`. That's it — scoring picks it up automatically,
@@ -224,8 +241,10 @@ tasks/_authoring/    generators: generate_families.py (133 templated tasks, 11 f
 tasks/_archive/      retired tasks, kept runnable but excluded from the matrix & scoring
 tasks/repos/         vendored real-repo snapshots (pinned @SHA) + curation guide
 adapters/            pi.sh, opencode.sh, hermes.sh, mock.sh (+ parsers) — add yours here
+                     usage.py: the metrics-line contract + provider-neutral token accounting
 engine/              setup.py (workdir/gradedir builder), preflight.sh (discrimination check),
-                     metrics_delta.py (per-run token/tok-s deltas from llama.cpp /metrics)
+                     metrics_delta.py (per-run token/tok-s deltas from llama.cpp /metrics),
+                     append_result.py (the results.csv schema; migrates an older one in place)
 run_one.sh           one (harness,task,repeat): setup -> invoke (timeout + runaway guard) ->
                      grade -> metrics -> csv
 run_matrix.sh        the full matrix (sequential, resumable, shuffled, warmup)
